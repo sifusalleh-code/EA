@@ -579,22 +579,16 @@ bool IsHealthyReentry(const ENUM_SIGNAL direction)
       }
    }
 
-   //--- Check momentum weakening filter
+   //--- Momentum weakening filter: compare absolute slope magnitudes for symmetric BUY/SELL logic
    if(InpUseMomentumWeakeningFilter && g_atrClosed > 0.0)
    {
       const double currentSlope = (g_fastClosed - g_fastSlopeBase) / _Point;
-      const double prevSlope = g_prevCandle_fastSlope;
+      const double currentSlopeAbs = MathAbs(currentSlope);
+      const double prevSlopeAbs = MathAbs(g_prevCandle_fastSlope);
       
-      if(direction == SIGNAL_BUY)
-      {
-         if(currentSlope < prevSlope * InpMomentumWeakeningRatio)
-            return false;
-      }
-      else if(direction == SIGNAL_SELL)
-      {
-         if(currentSlope > prevSlope * InpMomentumWeakeningRatio)
-            return false;
-      }
+      //--- Reject if current momentum magnitude is significantly weaker than previous candle
+      if(currentSlopeAbs < prevSlopeAbs * InpMomentumWeakeningRatio)
+         return false;
    }
 
    //--- Check exhaustion candle filter
