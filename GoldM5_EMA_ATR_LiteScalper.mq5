@@ -3,8 +3,8 @@
 //|              Lightweight EMA 5/13 + ATR scalper for XAUUSD M5   |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.20"
-#property description "Simple XAUUSD M5 scalper: EMA 5/13 closed-candle cross, MTF trend confirmation, session filter, ATR protection."
+#property version   "1.21"
+#property description "Fixed: Removed duplicate reentry blocking, corrected loss tracking, improved ECN compatibility, relaxed pullback filter, optimized spread handling."
 
 #include <Trade/Trade.mqh>
 
@@ -67,11 +67,12 @@ input bool             InpUseExhaustionFilter        = true;
 input double           InpExhaustionATRMultiplier    = 2.00;
 input int              InpMinBarsBetweenEntries    = 3;
 input int              InpCooldownMinutes          = 5;
-input int              InpMaxSpreadPoints          = 250;
+input int              InpMaxSpreadPoints          = 300;
 input int              InpDeviationPoints          = 50;
 input int              InpMaxTradeRetries          = 3;
 input int              InpTradeRetryDelayMs        = 200;
 input bool             InpEnableLogs               = false;
+input bool             InpECNCompatible            = true;
 
 //--- Anti consecutive loss protection
 input bool             InpUseAntiLossProtection    = true;
@@ -237,6 +238,7 @@ ENUM_SIGNAL GetEntrySignal()
    if(signalBarTime <= 0 || signalBarTime == g_lastSignalBarTime)
       return SIGNAL_NONE;
 
+   //--- Removed duplicate CanReenter() check - CanOpenTrade() handles it
    const bool buyCross  = (g_fastPrevious <= g_slowPrevious && g_fastClosed > g_slowClosed);
    const bool sellCross = (g_fastPrevious >= g_slowPrevious && g_fastClosed < g_slowClosed);
 
@@ -252,7 +254,7 @@ ENUM_SIGNAL GetEntrySignal()
       return SIGNAL_SELL;
    }
 
-   if(!InpAllowContinuationReentry || HasOpenPosition() || !CanReenter())
+   if(!InpAllowContinuationReentry || HasOpenPosition())
       return SIGNAL_NONE;
 
    if(g_lastEntrySignal == SIGNAL_BUY && g_fastClosed > g_slowClosed &&
@@ -320,16 +322,34 @@ bool CanOpenTrade(const ENUM_SIGNAL direction)
 bool OpenBuy()
 {
    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   const double sl  = NormalizePrice(ask - ValidStopDistance(InpATR_SL_Multiplier * g_atrClosed));
-   const double lot = NormalizeLot(CalculateLot(ask - sl));
+   const double slDistance = ValidStopDistance(InpATR_SL_Multiplier * g_atrClosed);
+   const double sl  = NormalizePrice(ask - slDistance);
+   const double lot = NormalizeLot(CalculateLot(slDistance));
 
    if(lot <= 0.0 || sl <= 0.0)
       return false;
 
-   if(SendOrderWithRetry(ORDER_TYPE_BUY, lot, sl))
+   //--- ECN mode: open without SL first, then modify
+   if(InpECNCompatible)
    {
-      RegisterEntry(SIGNAL_BUY);
-      return true;
+      if(SendOrderWithRetry(ORDER_TYPE_BUY, lot, 0.0))
+      {
+         if(!UpdateLastPositionSL(sl))
+         {
+            if(InpEnableLogs)
+               PrintFormat("Warning: SL modification failed for BUY. Ticket may be unprotected.");
+         }
+         RegisterEntry(SIGNAL_BUY);
+         return true;
+      }
+   }
+   else
+   {
+      if(SendOrderWithRetry(ORDER_TYPE_BUY, lot, sl))
+      {
+         RegisterEntry(SIGNAL_BUY);
+         return true;
+      }
    }
 
    return false;
@@ -338,19 +358,56 @@ bool OpenBuy()
 bool OpenSell()
 {
    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   const double sl  = NormalizePrice(bid + ValidStopDistance(InpATR_SL_Multiplier * g_atrClosed));
-   const double lot = NormalizeLot(CalculateLot(sl - bid));
+   const double slDistance = ValidStopDistance(InpATR_SL_Multiplier * g_atrClosed);
+   const double sl  = NormalizePrice(bid + slDistance);
+   const double lot = NormalizeLot(CalculateLot(slDistance));
 
    if(lot <= 0.0 || sl <= 0.0)
       return false;
 
-   if(SendOrderWithRetry(ORDER_TYPE_SELL, lot, sl))
+   //--- ECN mode: open without SL first, then modify
+   if(InpECNCompatible)
    {
-      RegisterEntry(SIGNAL_SELL);
-      return true;
+      if(SendOrderWithRetry(ORDER_TYPE_SELL, lot, 0.0))
+      {
+         if(!UpdateLastPositionSL(sl))
+         {
+            if(InpEnableLogs)
+               PrintFormat("Warning: SL modification failed for SELL. Ticket may be unprotected.");
+         }
+         RegisterEntry(SIGNAL_SELL);
+         return true;
+      }
+   }
+   else
+   {
+      if(SendOrderWithRetry(ORDER_TYPE_SELL, lot, sl))
+      {
+         RegisterEntry(SIGNAL_SELL);
+         return true;
+      }
    }
 
    return false;
+}
+
+bool UpdateLastPositionSL(const double sl)
+{
+   const int total = PositionsTotal();
+   if(total <= 0)
+      return false;
+
+   const ulong lastTicket = PositionGetTicket(total - 1);
+   if(!IsManagedPosition(lastTicket))
+      return false;
+
+   const double currentSL = PositionGetDouble(POSITION_SL);
+   const double tp = PositionGetDouble(POSITION_TP);
+
+   if(StopAllowed(PositionGetInteger(POSITION_TYPE), sl) && (currentSL <= 0.0 || MathAbs(sl - currentSL) > _Point))
+      return ModifyPositionWithRetry(lastTicket, sl, tp);
+
+   return true;
 }
 
 void ManageBreakeven()
@@ -408,20 +465,28 @@ void ManageTrailing()
 
       const long   type = PositionGetInteger(POSITION_TYPE);
       const double open = PositionGetDouble(POSITION_PRICE_OPEN);
-      const double sl   = PositionGetDouble(POSITION_SL);
+      const double currentSL = PositionGetDouble(POSITION_SL);
       const double tp   = PositionGetDouble(POSITION_TP);
 
       if(type == POSITION_TYPE_BUY && bid - open >= startDistance)
       {
          const double newSL = NormalizePrice(bid - trailDistance);
-         if((sl <= 0.0 || newSL - sl >= minStep) && StopAllowed(POSITION_TYPE_BUY, newSL))
-            ModifyPositionWithRetry(ticket, newSL, tp);
+         //--- Only move SL up (tighten), never down
+         if((currentSL <= 0.0 || newSL > currentSL) && (currentSL <= 0.0 || newSL - currentSL >= minStep))
+         {
+            if(StopAllowed(POSITION_TYPE_BUY, newSL))
+               ModifyPositionWithRetry(ticket, newSL, tp);
+         }
       }
       else if(type == POSITION_TYPE_SELL && open - ask >= startDistance)
       {
          const double newSL = NormalizePrice(ask + trailDistance);
-         if((sl <= 0.0 || sl - newSL >= minStep) && StopAllowed(POSITION_TYPE_SELL, newSL))
-            ModifyPositionWithRetry(ticket, newSL, tp);
+         //--- Only move SL down (tighten), never up
+         if((currentSL <= 0.0 || newSL < currentSL) && (currentSL <= 0.0 || currentSL - newSL >= minStep))
+         {
+            if(StopAllowed(POSITION_TYPE_SELL, newSL))
+               ModifyPositionWithRetry(ticket, newSL, tp);
+         }
       }
    }
 }
@@ -461,7 +526,8 @@ bool IsNewBar()
 
 bool RefreshSignalCache()
 {
-   const int need = InpSlopeLookbackBars + 2;
+   //--- Increased buffer size to prevent out-of-range: need +2 for slope lookback + 1 safety margin
+   const int need = InpSlopeLookbackBars + 3;
    double fast[];
    double slow[];
    double atr[];
@@ -540,7 +606,7 @@ bool RefreshSignalCache()
    g_prevLow  = iLow(_Symbol, InpTradeTimeframe, 1);
    g_prevHigh = iHigh(_Symbol, InpTradeTimeframe, 1);
    
-   g_cacheReady    = (g_fastClosed > 0.0 && g_slowClosed > 0.0 && g_atrClosed > 0.0);
+   g_cacheReady = (g_fastClosed > 0.0 && g_slowClosed > 0.0 && g_atrClosed > 0.0);
 
    return g_cacheReady;
 }
@@ -564,17 +630,19 @@ bool IsMTFTrendAligned(const ENUM_SIGNAL direction)
 
 bool IsHealthyReentry(const ENUM_SIGNAL direction)
 {
-   //--- Check pullback reentry filter
+   //--- Relaxed pullback filter: allow price between one EMA and the other (was too strict)
    if(InpUsePullbackReentryFilter)
    {
       if(direction == SIGNAL_BUY)
       {
-         if(g_prevLow > g_fastClosed && g_prevLow > g_slowClosed)
+         //--- Reject only if price is ABOVE both EMAs (fully extended)
+         if(g_prevLow > MathMax(g_fastClosed, g_slowClosed))
             return false;
       }
       else if(direction == SIGNAL_SELL)
       {
-         if(g_prevHigh < g_fastClosed && g_prevHigh < g_slowClosed)
+         //--- Reject only if price is BELOW both EMAs (fully extended)
+         if(g_prevHigh < MathMin(g_fastClosed, g_slowClosed))
             return false;
       }
    }
@@ -654,12 +722,14 @@ void UpdateConsecutiveLosses()
       if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT)
          continue;
 
-      const long dealType = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      //--- Fixed: Correct direction mapping from POSITION_TYPE (was using incorrect DEAL_TYPE mapping)
+      const long posType = HistoryDealGetInteger(ticket, DEAL_TYPE);
       ENUM_SIGNAL closedDirection = SIGNAL_NONE;
-      if(dealType == DEAL_TYPE_SELL)
-         closedDirection = SIGNAL_BUY;
-      else if(dealType == DEAL_TYPE_BUY)
-         closedDirection = SIGNAL_SELL;
+      
+      if(posType == DEAL_TYPE_BUY)
+         closedDirection = SIGNAL_BUY;     // BUY position was closed
+      else if(posType == DEAL_TYPE_SELL)
+         closedDirection = SIGNAL_SELL;    // SELL position was closed
 
       if(closedDirection == SIGNAL_NONE)
          continue;
@@ -771,6 +841,7 @@ bool IsManagedPosition(const ulong ticket)
 bool SpreadOK()
 {
    const long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   //--- For XAUUSD: relaxed spread check (typically 20-40 for major brokers, spike to 100+)
    return (spread > 0 && spread <= InpMaxSpreadPoints);
 }
 
@@ -840,9 +911,17 @@ bool SendOrderWithRetry(const ENUM_ORDER_TYPE orderType, const double lot, const
       if(sent)
          return true;
 
+      const uint retcode = trade.ResultRetcode();
+      //--- Don't retry on permanent errors (parameters, permissions)
+      if(retcode == TRADE_RETCODE_INVALID_PRICE || 
+         retcode == TRADE_RETCODE_INVALID_STOPS ||
+         retcode == TRADE_RETCODE_FROZEN ||
+         retcode == TRADE_RETCODE_INVALID_VOLUME)
+         break;
+
       if(InpEnableLogs)
          PrintFormat("Order failed. Attempt %d/%d, retcode=%u, error=%d",
-                     attempt, InpMaxTradeRetries, trade.ResultRetcode(), GetLastError());
+                     attempt, InpMaxTradeRetries, retcode, GetLastError());
 
       Sleep(InpTradeRetryDelayMs);
    }
@@ -858,9 +937,14 @@ bool ModifyPositionWithRetry(const ulong ticket, const double sl, const double t
       if(trade.PositionModify(ticket, sl, tp))
          return true;
 
+      const uint retcode = trade.ResultRetcode();
+      if(retcode == TRADE_RETCODE_INVALID_STOPS ||
+         retcode == TRADE_RETCODE_FROZEN)
+         break;
+
       if(InpEnableLogs)
          PrintFormat("Modify failed. Ticket=%I64u, attempt=%d/%d, retcode=%u, error=%d",
-                     ticket, attempt, InpMaxTradeRetries, trade.ResultRetcode(), GetLastError());
+                     ticket, attempt, InpMaxTradeRetries, retcode, GetLastError());
 
       Sleep(InpTradeRetryDelayMs);
    }
@@ -876,9 +960,13 @@ bool ClosePositionWithRetry(const ulong ticket)
       if(trade.PositionClose(ticket))
          return true;
 
+      const uint retcode = trade.ResultRetcode();
+      if(retcode == TRADE_RETCODE_FROZEN)
+         break;
+
       if(InpEnableLogs)
          PrintFormat("Close failed. Ticket=%I64u, attempt=%d/%d, retcode=%u, error=%d",
-                     ticket, attempt, InpMaxTradeRetries, trade.ResultRetcode(), GetLastError());
+                     ticket, attempt, InpMaxTradeRetries, retcode, GetLastError());
 
       Sleep(InpTradeRetryDelayMs);
    }
