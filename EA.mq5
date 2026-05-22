@@ -18,9 +18,6 @@ const datetime ExpiryDate = D'2026.12.31 23:59';
 const string SUPPORT_WHATSAPP = "0149075857";
 const string EA_NAME = "EAPro V1.04";
 
-bool licenseValid = false;
-bool licenseExpired = false;
-
 // ======================== PRIMARY INPUTS ========================
 input double InpLotSize            = 0.01;       // Lot Size
 input ENUM_TIMEFRAMES InpTimeframe = PERIOD_CURRENT; // Timeframe
@@ -1193,6 +1190,17 @@ int OnInit()
 
    AreIndicatorsReady();
 
+   // ======================== LICENSE LOG ========================
+   if(!IsAccountAuthorized())
+   {
+      Print("LICENSE INVALID");
+   }
+
+   if(IsExpired())
+   {
+      Print("LICENSE EXPIRED");
+   }
+
    return INIT_SUCCEEDED;
 }
 
@@ -1285,24 +1293,27 @@ void OnTick()
                PassesFilters(signal, fast1, fast2, slow1, atr1) &&
                PassesMtfTrendConfirm(signal))
             {
-               OpenSignalPosition(signal, tick);
-
-               if(signal == SIGNAL_BUY)
+               if(OpenSignalPosition(signal, tick))
                {
-                  buyReentryCount = 0;
-                  previousTrendWasBuy = true;
-                  previousTrendWasSell = false;
-               }
-               else if(signal == SIGNAL_SELL)
-               {
-                  sellReentryCount = 0;
-                  previousTrendWasSell = true;
-                  previousTrendWasBuy = false;
+                  if(signal == SIGNAL_BUY)
+                  {
+                     buyReentryCount = 0;
+                     previousTrendWasBuy = true;
+                     previousTrendWasSell = false;
+                  }
+                  else if(signal == SIGNAL_SELL)
+                  {
+                     sellReentryCount = 0;
+                     previousTrendWasSell = true;
+                     previousTrendWasBuy = false;
+                  }
                }
             }
          }
 
-         // REENTRY LOGIC
+         // REENTRY LOGIC - REFRESH STATS FIRST
+         stats = GetManagedPositionStats();
+
          if(InpUseReentry && stats.totalCount == 0)
          {
             double fast3 = 0.0;
